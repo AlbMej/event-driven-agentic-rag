@@ -9,17 +9,34 @@ from agent_activities.shared_data_types import ProgressUpdate, DocIngestResult
 from llama_parse import LlamaParse  # For document parsing
 from llama_index.llms.google_genai import GoogleGenAI  # For LLM operations
 from llama_index.core import StorageContext, load_index_from_storage  # For loading indexed data
-from llama_index.core import VectorStoreIndex  # For vector store indexing
+from llama_index.core import VectorStoreIndex 
 from llama_index.embeddings.google_genai import GoogleGenAIEmbedding  # For embedding documents
 # Vector Database
-# import qdrant_client
+import qdrant_client  # For vector store indexing
+from llama_index.vector_stores.qdrant import QdrantVectorStore
 
 
+# --- Google Gemini Configuration ---
 GEMINI_API_KEY = secret_config.GEMINI_API_KEY
 GEMINI_MODEL = "models/gemini-1.5-flash-8b"
 EMBEDDING_MODEL_TYPE = "models/embedding-001"
 EMBED_MODEL = GoogleGenAIEmbedding(model=EMBEDDING_MODEL_TYPE, api_key=GEMINI_API_KEY)
-STORAGE_DIR = "./storage"
+# Can also use FastEmbedding: https://docs.llamaindex.ai/en/stable/examples/vector_stores/QdrantIndexDemo/
+
+# --- Qdrant Configuration ---
+QDRANT_HOST = "localhost"
+QDRANT_PORT = 6333
+COLLECTION_NAME = "resume_collection"
+
+# Initialize Qdrant client (See: https://qdrant.tech/documentation/database-tutorials/async-api/)
+QDRANT_CLIENT = qdrant_client.AsyncQdrantClient(
+    # Use in-memory Qdrant for fast and light-weight experiments
+    # location=":memory:",
+    # If using a Qdrant instance (local or remote) use:
+    url=f"http://{QDRANT_HOST}:{QDRANT_PORT}",
+    # If using Qdrant Cloud, set your Qdrant API KEY
+    # api_key="<qdrant-api-key>"
+)
 
 
 @dataclass
@@ -61,25 +78,31 @@ async def parse_document(document: str, prompt_guidance: str) -> list:
     return document_objects
 
 
-async def create_llama_vector_store_index(document_objects) -> None:
+async def create_vector_store_index(document_objects) -> None:
     """
     Indexes the parsed document data for retrieval.
+
+    Reference(s):
+        [1] https://docs.llamaindex.ai/en/stable/examples/vector_stores/QdrantIndexDemo/ 
     """
     activity.heartbeat(ProgressUpdate(msg="Indexing document..."))
-
-    # Check if the index is stored on disk TODO: implement more robust check
-    if os.path.exists(STORAGE_DIR):  # Simply see if directory already created
-        # Document index already exists
-        return
-    
-    # Create a VectorStoreIndex from the parsed document objects
-    vector_store = VectorStoreIndex.from_documents(
-        documents=document_objects,
-        embed_model=EMBED_MODEL
+    # Connect to existing Qdrant collection (if it exists) or create a new one
+    vector_store = QdrantVectorStore(
+        aclient=QDRANT_CLIENT,
+        collection_name=COLLECTION_NAME,
     )
-
-    # Store index to disk for persistence (in production, use a hosted vector store)
-    vector_store.storage_context.persist(persist_dir=STORAGE_DIR)
+    # Create storage context with Qdrant vector store
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+    
+    # Optionally, you can set the embedding model
+    
+    # Create the VectorStoreIndex from the parsed documents
+    qdrant_index = VectorStoreIndex.from_documents(
+        documents=document_objects,
+        storage_context=storage_context,
+        embed_model=EMBED_MODEL,  # Replace LlamaIndex OpenAIEmbedding default with GeminiEmbedding
+        use_async=True,  # Build the VectorStoreIndex asynchronously
+    )
 
     activity.heartbeat(ProgressUpdate(msg="Document indexing complete."))
 
@@ -101,7 +124,7 @@ async def ingest_and_index_document(ingest_input: IngestInput) -> DocIngestResul
     parsed_data = await parse_document(file_path, parse_prompt)
 
     # Feed Document objects to VectorStoreIndex
-    await create_llama_vector_store_index(parsed_data)
+    await create_vector_store_index(parsed_data)
 
     return DocIngestResult(status="Success")
 
@@ -121,16 +144,25 @@ async def query_indexed_document(query_input: QueryInput) -> str:
     query = query_input.query
     api_key = GEMINI_API_KEY  # query_input.api_key # TODO: Use passed-in api_key if deployed
 
-    # Using LLama VectorStoreIndex for querying
-    storage_context = StorageContext.from_defaults(persist_dir=STORAGE_DIR)
-    index = load_index_from_storage(storage_context, embed_model=EMBED_MODEL)
+    # Connect to existing Qdrant collection (if it exists) or create a new one
+    vector_store = QdrantVectorStore(
+        aclient=QDRANT_CLIENT,
+        collection_name=COLLECTION_NAME,
+    )
 
-    # LLM model for querying
-    llm = GoogleGenAI(model=GEMINI_MODEL, api_key=api_key)  # TODO: use passed-in api_key if deployed
-    query_engine = index.as_query_engine(llm=llm, similarity_top_k=5)
+    # Load the index directly from VectorStore
+    qdrant_index = VectorStoreIndex.from_vector_store(
+        vector_store=vector_store,
+        embed_model=EMBED_MODEL,
+        use_async=True,
+    )
+
+    # LLM model for generating query response
+    llm = GoogleGenAI(model=GEMINI_MODEL, api_key=api_key)
+    query_engine = qdrant_index.as_query_engine(llm=llm, similarity_top_k=5)  # Use top 5 most similar vectors
 
     # Perform the query
-    response = await query_engine.aquery(query)
+    response = await query_engine.aquery(query)  # Create question vector, perform similarity search
     activity.heartbeat(ProgressUpdate(msg="Query complete."))
 
     return str(response)

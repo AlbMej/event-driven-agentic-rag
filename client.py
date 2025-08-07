@@ -25,7 +25,7 @@ async def main():
     doc_path = "./Alberto_Mejia_Resume.pdf" # input("Enter document path: ")
     # Prompt user for their query
     print("What's your query about this document?")
-    usr_query = "What's the persons work experience" # input("Enter query: ")
+    usr_query = "Who is this person and what do they do?" # input("Enter query: ")
     print("-" * 25)
     print("Starting workflow from user inputs...")
     # --- Create inputs for RAG ---
