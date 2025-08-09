@@ -31,5 +31,10 @@ These steps assume a local Qdrant and local Temporal service instance:
 
 # Improvements
 This is just a POC to see how these technologies can work togther. Some things to note:
+
 1. Agentic capabilities. I used LlamaIndex's `FunctionTool` and `FunctionCallingAgent` for ease of use. But Temporal requires Workflow code to be deterministic (of which LLM calls are not). To solve this, you'd need to keep this usage only within Activities (built for non-deterministic behavior) or re-implement them to work with Temporal workflows (allows for more granularity).
 2. Conversation History. Currently, this doesn't keep the converation history (durable or not). There should be some ways to use Llama's Memory [component](https://docs.llamaindex.ai/en/stable/module_guides/deploying/agents/memory/) within an activity to make the conversation history durable. 
+
+# TODO
+- Currently one shot execution. If a user asks a general question, the agent selects the `general_knowledge_query` tool which asks for follow up context. However, the client will end once it gets it's first message. Will have to poll the workflow (via workflow query) to get conversation updates and signal the workflow to take user input. Packaging this with a UI would require a lot more effort. See [temporal-ai-agent](https://github.com/temporal-community/temporal-ai-agent/blob/main/workflows/agent_goal_workflow.py#L96) for a complete example. 
+- API key get's shown in Temporal service. Encrypt it 

@@ -1,19 +1,24 @@
-from dataclasses import dataclass
-import os
-
+import traceback
 import secret_config
 from temporalio import activity
-from agent_activities.shared_data_types import ProgressUpdate, DocIngestResult
+from agent_activities.shared_data_types import (
+    ProgressUpdate, DocIngestResult,
+    IngestInput, QueryInput,
+    AgentTask, AgentResult
+)
 # Llama imports
 # from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_parse import LlamaParse  # For document parsing
 from llama_index.llms.google_genai import GoogleGenAI  # For LLM operations
-from llama_index.core import StorageContext, load_index_from_storage  # For loading indexed data
-from llama_index.core import VectorStoreIndex 
+from llama_index.core import StorageContext  #
+from llama_index.core import VectorStoreIndex
 from llama_index.embeddings.google_genai import GoogleGenAIEmbedding  # For embedding documents
 # Vector Database
 import qdrant_client  # For vector store indexing
 from llama_index.vector_stores.qdrant import QdrantVectorStore
+# Agentic imports
+from llama_index.core.tools import FunctionTool
+from llama_index.core.agent.workflow import FunctionAgent  
 
 
 # --- Google Gemini Configuration ---
@@ -39,24 +44,6 @@ QDRANT_CLIENT = qdrant_client.AsyncQdrantClient(
 )
 
 
-@dataclass
-class IngestInput:
-    """
-    Input data for document ingestion activity.
-    """
-    document: str
-    prompt_guidance: str
-
-
-@dataclass
-class QueryInput:
-    """
-    Input data for document query activity.
-    """
-    query: str
-    api_key: str
-
-
 async def parse_document(document: str, prompt_guidance: str) -> list:
     """
     Parses a document and returns the parsed data.
@@ -78,6 +65,7 @@ async def parse_document(document: str, prompt_guidance: str) -> list:
     return document_objects
 
 
+# --- RAG Activities ---
 async def create_vector_store_index(document_objects) -> None:
     """
     Indexes the parsed document data for retrieval.
@@ -85,7 +73,8 @@ async def create_vector_store_index(document_objects) -> None:
     Reference(s):
         [1] https://docs.llamaindex.ai/en/stable/examples/vector_stores/QdrantIndexDemo/ 
     """
-    activity.heartbeat(ProgressUpdate(msg="Indexing document..."))
+    activity.logger.info(ProgressUpdate(msg="Indexing document..."))
+
     # Connect to existing Qdrant collection (if it exists) or create a new one
     vector_store = QdrantVectorStore(
         aclient=QDRANT_CLIENT,
@@ -93,9 +82,6 @@ async def create_vector_store_index(document_objects) -> None:
     )
     # Create storage context with Qdrant vector store
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
-    
-    # Optionally, you can set the embedding model
-    
     # Create the VectorStoreIndex from the parsed documents
     qdrant_index = VectorStoreIndex.from_documents(
         documents=document_objects,
@@ -103,9 +89,7 @@ async def create_vector_store_index(document_objects) -> None:
         embed_model=EMBED_MODEL,  # Replace LlamaIndex OpenAIEmbedding default with GeminiEmbedding
         use_async=True,  # Build the VectorStoreIndex asynchronously
     )
-
-    activity.heartbeat(ProgressUpdate(msg="Document indexing complete."))
-
+    activity.logger.info(ProgressUpdate(msg="Document indexing complete."))
 
 @activity.defn
 async def ingest_and_index_document(ingest_input: IngestInput) -> DocIngestResult:
@@ -119,50 +103,85 @@ async def ingest_and_index_document(ingest_input: IngestInput) -> DocIngestResul
     """
     file_path = ingest_input.document
     parse_prompt = ingest_input.prompt_guidance
-
     # Parse the document using LlamaParse
     parsed_data = await parse_document(file_path, parse_prompt)
-
     # Feed Document objects to VectorStoreIndex
     await create_vector_store_index(parsed_data)
-
+    # TODO: Handle exceptions
     return DocIngestResult(status="Success")
 
 
 @activity.defn
-async def query_indexed_document(query_input: QueryInput) -> str:
+async def llama_index_agent(task: AgentTask) -> AgentResult:
     """
-    Query the indexed document and return the response.
-
-    This function uses the VectorStoreIndex to retrieve relevant information based on the query.
-
-    Reference(s):
-        [1] https://docs.llamaindex.ai/en/stable/module_guides/deploying/query_engine/
-        [2] https://docs.llamaindex.ai/en/stable/understanding/querying/querying/
+    LlamaIndex agent for processing tasks.
     """
-    activity.heartbeat(ProgressUpdate(msg="Querying indexed document..."))
-    query = query_input.query
-    api_key = GEMINI_API_KEY  # query_input.api_key # TODO: Use passed-in api_key if deployed
+    activity.logger.info(f"Executing agent task: {task}")
 
-    # Connect to existing Qdrant collection (if it exists) or create a new one
-    vector_store = QdrantVectorStore(
-        aclient=QDRANT_CLIENT,
-        collection_name=COLLECTION_NAME,
-    )
+    try:
+        api_key = task.api_key
 
-    # Load the index directly from VectorStore
-    qdrant_index = VectorStoreIndex.from_vector_store(
-        vector_store=vector_store,
-        embed_model=EMBED_MODEL,
-        use_async=True,
-    )
+        
+        # Define tool functions for the agent
+        async def query_indexed_document(query: str) -> str:
+            """
+            Use this tool to answer questions about the person whose resume has been provided.
+            This tool will query the indexed document to retrieve relevant information based on the query.
+            """
+            activity.logger.info(ProgressUpdate(msg="[Agent Tool] Querying indexed document..."))
+            # Connect to existing Qdrant collection (if it exists) or create a new one
+            vector_store = QdrantVectorStore(
+                aclient=QDRANT_CLIENT,
+                collection_name=COLLECTION_NAME,
+            )
+            # Load the index directly from VectorStore
+            qdrant_index = VectorStoreIndex.from_vector_store(
+                vector_store=vector_store,
+                embed_model=EMBED_MODEL,
+                use_async=True,
+            )
+            # LLM model for generating query response
+            llm = GoogleGenAI(model=GEMINI_MODEL, api_key=api_key)
+            query_engine = qdrant_index.as_query_engine(llm=llm, similarity_top_k=5)  # Use top 5 most similar vectors
+            # Perform the query
+            response = await query_engine.aquery(query)  # Create question vector, perform similarity search
+            activity.logger.info(ProgressUpdate(msg="[Agent Tool] Query complete."))
+            # TODO: try and except
+            return str(response)
 
-    # LLM model for generating query response
-    llm = GoogleGenAI(model=GEMINI_MODEL, api_key=api_key)
-    query_engine = qdrant_index.as_query_engine(llm=llm, similarity_top_k=5)  # Use top 5 most similar vectors
+        async def general_knowledge_query(query: str) -> str:
+            """Answer general questions."""
+            activity.logger.info(ProgressUpdate(msg="[Agent Tool] Querying general knowledge..."))
+            llm = GoogleGenAI(model=GEMINI_MODEL, api_key=api_key)
+            response = await llm.complete(f"Answer this question: {query}")
+            return response.text
 
-    # Perform the query
-    response = await query_engine.aquery(query)  # Create question vector, perform similarity search
-    activity.heartbeat(ProgressUpdate(msg="Query complete."))
+        # Create tools
+        resume_tool = FunctionTool.from_defaults(fn=query_indexed_document)
+        general_tool = FunctionTool.from_defaults(fn=general_knowledge_query)
 
-    return str(response)
+        # Create agent
+        llm = GoogleGenAI(model="models/gemini-1.5-flash-8b", api_key=api_key)
+        agent = FunctionAgent(
+            name="Agent",
+            tools=[resume_tool, general_tool],
+            llm=llm,
+            verbose=True
+        )
+
+        # Agent reasoning (non-deterministic)
+        response = await agent.run(task.query)
+
+        return AgentResult(
+            status="Success",
+            result=str(response)
+        )
+
+    except Exception as e:
+        detailed_error = traceback.format_exc()
+        agent_result = AgentResult(
+            status="Failed",
+            result=f"Agent failed: {detailed_error}"
+        )
+        activity.logger.error(f"{agent_result.result}")
+        raise  # Fail workflow execution
