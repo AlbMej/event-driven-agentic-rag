@@ -3,6 +3,7 @@ secret_config.py
 
 # Local storage
 storage/
+qdrant_storage/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
